@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package webcontent;
+
+service WebContentService {
+  rpc ExtractContent (ExtractContentRequest) returns (ExtractContentResponse);
+}
+
+message ExtractContentRequest {
+  string url = 1;
+  bool output_md = 2;
+  bool use_openai = 3;
+  string model = 4;
+  string prompt = 5;
+  bool take_screenshot = 6;
+}
+
+message ExtractContentResponse {
+  string html = 1;
+  string markdown = 2;
+  bytes screenshot = 3;
+  string openai_response = 4;
+  string error = 5;
+} 
