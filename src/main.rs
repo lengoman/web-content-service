@@ -144,7 +144,7 @@ async fn main() -> anyhow::Result<()> {
         browser: Arc::new(Mutex::new(browser)),
     };
     // let addr = format!("[::1]:{}", cli.port).parse()?;
-    let addr = format!("[0.0.0.0]:{}", cli.port).parse()?;
+    let addr = format!("[::0]:{}", cli.port).parse()?;
     println!("Starting gRPC server on {}", addr);
     Server::builder()
         .add_service(WebContentServiceServer::new(service))
