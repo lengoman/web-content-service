@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tonic::{transport::Server, Request, Response, Status};
 use playwright::api::DocumentLoadState;
+use playwright::api::BrowserContext;
 use chrono;
 
 // Import the generated proto module
@@ -24,8 +25,43 @@ struct Cli {
     browser_executable: Option<String>,
 }
 
+struct ContextPool {
+    pool: Arc<Mutex<Vec<BrowserContext>>>,
+}
+
+impl ContextPool {
+    async fn new(size: usize, browser: &playwright::api::Browser) -> Self {
+        let mut contexts = Vec::with_capacity(size);
+        for _ in 0..size {
+            let context = browser.context_builder()
+                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36")
+                .build().await.unwrap();
+            contexts.push(context);
+        }
+        Self {
+            pool: Arc::new(Mutex::new(contexts)),
+        }
+    }
+
+    async fn acquire(&self) -> BrowserContext {
+        loop {
+            let mut pool = self.pool.lock().await;
+            if let Some(context) = pool.pop() {
+                return context;
+            }
+            drop(pool);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn release(&self, context: BrowserContext) {
+        let mut pool = self.pool.lock().await;
+        pool.push(context);
+    }
+}
+
 struct ExtractorService {
-    browser: Arc<Mutex<playwright::api::Browser>>,
+    context_pool: Arc<ContextPool>,
 }
 
 #[tonic::async_trait]
@@ -35,7 +71,6 @@ impl WebContentService for ExtractorService {
         request: Request<ExtractContentRequest>,
     ) -> Result<Response<ExtractContentResponse>, Status> {
         let req = request.into_inner();
-        let browser = self.browser.clone();
         let url = req.url.clone();
         let output_md = req.output_md;
         let use_openai = req.use_openai;
@@ -50,10 +85,7 @@ impl WebContentService for ExtractorService {
         let start = std::time::Instant::now();
         // Extraction logic
         let result = async {
-            let browser = browser.lock().await;
-            let context = browser.context_builder()
-                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36")
-                .build().await?;
+            let context = self.context_pool.acquire().await;
             let page = context.new_page().await?;
             page.goto_builder(&url)
                 .wait_until(DocumentLoadState::DomContentLoaded)
@@ -110,6 +142,7 @@ impl WebContentService for ExtractorService {
                     }
                 }
             }
+            self.context_pool.release(context).await;
             Ok::<(), anyhow::Error>(())
         }.await;
         if let Err(e) = result {
@@ -131,7 +164,6 @@ impl WebContentService for ExtractorService {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    // Use the provided browser executable or the default
     let browser_executable = cli.browser_executable.unwrap_or_else(|| "/Users/ivanarambula/Library/Caches/ms-playwright/chromium-1169/chrome-mac/Chromium.app/Contents/MacOS/Chromium".to_string());
     let playwright = Playwright::initialize().await?;
     let browser = playwright.chromium()
@@ -140,10 +172,11 @@ async fn main() -> anyhow::Result<()> {
         .headless(true)
         .launch()
         .await?;
+    let pool_size = 4;
+    let context_pool = ContextPool::new(pool_size, &browser).await;
     let service = ExtractorService {
-        browser: Arc::new(Mutex::new(browser)),
+        context_pool: Arc::new(context_pool),
     };
-    // let addr = format!("[::1]:{}", cli.port).parse()?;
     let addr = format!("[::0]:{}", cli.port).parse()?;
     println!("Starting gRPC server on {}", addr);
     Server::builder()
