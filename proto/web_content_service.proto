@@ -13,6 +13,7 @@ message ExtractContentRequest {
   string model = 4;
   string prompt = 5;
   bool take_screenshot = 6;
+  bool use_cache = 7;
 }
 
 message ExtractContentResponse {

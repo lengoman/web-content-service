@@ -15,6 +15,69 @@ pub mod webcontent {
 use webcontent::web_content_service_server::{WebContentService, WebContentServiceServer};
 use webcontent::{ExtractContentRequest, ExtractContentResponse};
 
+mod cache {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
+    use chrono::Local;
+    use directories::BaseDirs;
+    use rusqlite::{params, Connection};
+    use std::fs;
+    use std::path::PathBuf;
+
+    pub fn cache_dir_for_today() -> PathBuf {
+        let base = BaseDirs::new().unwrap();
+        let date = Local::now().format("%Y-%m-%d").to_string();
+        base.cache_dir().join("web-content-extract").join(&date)
+    }
+
+    pub fn init_cache_db() -> Connection {
+        let dir = cache_dir_for_today();
+        fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("cache.db");
+        let conn = Connection::open(db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS cache (
+                url TEXT PRIMARY KEY,
+                date TEXT,
+                file_path TEXT
+            )",
+            [],
+        ).unwrap();
+        conn
+    }
+
+    pub fn get_cached_html(url: &str) -> Option<(String, String)> {
+        let conn = init_cache_db();
+        let date = Local::now().format("%Y-%m-%d").to_string();
+        let mut stmt = conn.prepare("SELECT file_path, date FROM cache WHERE url = ?1").ok()?;
+        let mut rows = stmt.query(params![url]).ok()?;
+        if let Some(row) = rows.next().ok()? {
+            let file_path: String = row.get(0).ok()?;
+            let cached_date: String = row.get(1).ok()?;
+            if cached_date == date {
+                let html = fs::read_to_string(&file_path).ok()?;
+                return Some((html, file_path));
+            }
+        }
+        None
+    }
+
+    pub fn set_cached_html(url: &str, html: &str) -> std::io::Result<()> {
+        let dir = cache_dir_for_today();
+        fs::create_dir_all(&dir)?;
+        let file_name = URL_SAFE_NO_PAD.encode(url);
+        let file_path = dir.join(format!("{}.html", file_name));
+        fs::write(&file_path, html)?;
+        let conn = init_cache_db();
+        let date = Local::now().format("%Y-%m-%d").to_string();
+        conn.execute(
+            "INSERT OR REPLACE INTO cache (url, date, file_path) VALUES (?1, ?2, ?3)",
+            params![url, date, file_path.to_string_lossy()],
+        ).unwrap();
+        Ok(())
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
@@ -24,6 +87,9 @@ struct Cli {
     /// The path to the Chromium executable
     #[arg(long, value_name = "PATH")]
     browser_executable: Option<String>,
+    /// Use cache for website content
+    #[arg(long, default_value_t = true)]
+    use_cache: bool,
 }
 
 struct ContextPool {
@@ -82,6 +148,7 @@ struct ExtractorService {
     browser_executable: String,
     pool_size: usize,
     playwright: Playwright,
+    use_cache: bool,
 }
 
 impl ExtractorService {
@@ -194,7 +261,6 @@ impl WebContentService for ExtractorService {
         request: Request<ExtractContentRequest>,
     ) -> Result<Response<ExtractContentResponse>, Status> {
         self.maybe_reset_browser().await;
-        let context_pool = self.get_context_pool().await;
         let req = request.into_inner();
         let url = req.url.clone();
         let output_md = req.output_md;
@@ -208,6 +274,23 @@ impl WebContentService for ExtractorService {
         let mut openai_response = String::new();
         let mut error = String::new();
         let start = std::time::Instant::now();
+
+        // Check cache before fetching if enabled (server-side)
+        if self.use_cache {
+            if let Some((cached_html, _file_path)) = cache::get_cached_html(&url) {
+                html = cached_html;
+                let elapsed = start.elapsed();
+                let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+                println!("[{}] [web-content-service] URL: {} | Elapsed time: {:.2?} | Used: cache", now, url, elapsed);
+                return Ok(Response::new(ExtractContentResponse {
+                    html,
+                    markdown,
+                    screenshot,
+                    openai_response,
+                    error,
+                }));
+            }
+        }
 
         // Parallel extraction logic
         let direct_fut = self.fetch_direct(&url);
@@ -257,6 +340,10 @@ impl WebContentService for ExtractorService {
                     }
                 }
             }
+        }
+        // Store in cache after successful fetch if enabled (server-side)
+        if html_ok && self.use_cache {
+            let _ = cache::set_cached_html(&url, &html);
         }
         if html_ok {
             // Remove <script>, <style>, <iframe>, <noscript> tags and their content using regex (no backreferences)
@@ -344,6 +431,7 @@ async fn main() -> anyhow::Result<()> {
         browser_executable,
         pool_size,
         playwright,
+        use_cache: cli.use_cache,
     };
     let addr = format!("[::0]:{}", cli.port).parse()?;
     println!("Starting gRPC server on {}", addr);

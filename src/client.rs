@@ -49,6 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         model: cli.model,
         prompt: cli.prompt,
         take_screenshot: cli.take_screenshot,
+        use_cache: false, // always false, server controls cache
     });
     let response = client.extract_content(request).await?.into_inner();
     if !response.error.is_empty() {

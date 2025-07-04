@@ -19,6 +19,9 @@ url = "2.5"
 tonic = { version = "0.13", features = ["transport"] }
 prost = "0.13"
 chrono = "0.4.41"
+rusqlite = { version = "0.31", features = ["bundled"] }
+directories = "5.0"
+base64 = "0.21.7"
 
 [build-dependencies]
 tonic-build = "0.13"
