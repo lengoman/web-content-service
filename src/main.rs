@@ -138,7 +138,6 @@ impl Clone for ContextPool {
 struct SharedState {
     browser: Option<Browser>,
     context_pool: Option<ContextPool>,
-    request_count: usize,
 }
 
 type SharedStateArc = Arc<Mutex<SharedState>>;
@@ -152,28 +151,8 @@ struct ExtractorService {
 }
 
 impl ExtractorService {
-    async fn maybe_reset_browser(&self) {
-        let mut state = self.shared_state.lock().await;
-        state.request_count += 1;
-        if state.request_count >= 10 {
-            // Drop old browser and context pool
-            state.browser = None;
-            state.context_pool = None;
-            // Create new browser and context pool
-            let browser = self.playwright.chromium()
-                .launcher()
-                .executable(std::path::Path::new(&self.browser_executable))
-                .headless(true)
-                .launch()
-                .await
-                .expect("Failed to relaunch browser");
-            let context_pool = ContextPool::new(self.pool_size, &browser).await;
-            state.browser = Some(browser);
-            state.context_pool = Some(context_pool);
-            state.request_count = 0;
-            println!("[web-content-service] Browser and context pool reset after 10 requests");
-        }
-    }
+    // No-op: browser reset is now only on error
+    async fn maybe_reset_browser(&self) {}
     async fn get_context_pool(&self) -> ContextPool {
         let state = self.shared_state.lock().await;
         state.context_pool.as_ref().unwrap().clone()
@@ -227,7 +206,6 @@ impl ExtractorService {
         let context_pool = ContextPool::new(self.pool_size, &browser).await;
         state.browser = Some(browser);
         state.context_pool = Some(context_pool);
-        state.request_count = 0;
         println!("[web-content-service] Browser and context pool reset due to timeout");
     }
 
@@ -424,7 +402,6 @@ async fn main() -> anyhow::Result<()> {
     let shared_state = Arc::new(Mutex::new(SharedState {
         browser: Some(browser),
         context_pool: Some(context_pool),
-        request_count: 0,
     }));
     let service = ExtractorService {
         shared_state: shared_state.clone(),
