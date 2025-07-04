@@ -1,11 +1,12 @@
+use chrono;
 use clap::Parser;
+use playwright::api::Browser;
+use playwright::api::BrowserContext;
+use playwright::api::DocumentLoadState;
 use playwright::Playwright;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tonic::{transport::Server, Request, Response, Status};
-use playwright::api::DocumentLoadState;
-use playwright::api::BrowserContext;
-use chrono;
 
 // Import the generated proto module
 pub mod webcontent {
@@ -60,8 +61,88 @@ impl ContextPool {
     }
 }
 
+impl Clone for ContextPool {
+    fn clone(&self) -> Self {
+        Self {
+            pool: self.pool.clone(),
+        }
+    }
+}
+
+struct SharedState {
+    browser: Option<Browser>,
+    context_pool: Option<ContextPool>,
+    request_count: usize,
+}
+
+type SharedStateArc = Arc<Mutex<SharedState>>;
+
 struct ExtractorService {
-    context_pool: Arc<ContextPool>,
+    shared_state: SharedStateArc,
+    browser_executable: String,
+    pool_size: usize,
+    playwright: Playwright,
+}
+
+impl ExtractorService {
+    async fn maybe_reset_browser(&self) {
+        let mut state = self.shared_state.lock().await;
+        state.request_count += 1;
+        if state.request_count >= 10 {
+            // Drop old browser and context pool
+            state.browser = None;
+            state.context_pool = None;
+            // Create new browser and context pool
+            let browser = self.playwright.chromium()
+                .launcher()
+                .executable(std::path::Path::new(&self.browser_executable))
+                .headless(true)
+                .launch()
+                .await
+                .expect("Failed to relaunch browser");
+            let context_pool = ContextPool::new(self.pool_size, &browser).await;
+            state.browser = Some(browser);
+            state.context_pool = Some(context_pool);
+            state.request_count = 0;
+            println!("[web-content-service] Browser and context pool reset after 10 requests");
+        }
+    }
+    async fn get_context_pool(&self) -> ContextPool {
+        let state = self.shared_state.lock().await;
+        state.context_pool.as_ref().unwrap().clone()
+    }
+
+    async fn fetch_direct(&self, url: &str) -> Result<String, String> {
+        let client = reqwest::Client::new();
+        let resp = client.get(url).send().await.map_err(|e| format!("Direct fetch error: {}", e))?;
+        let status = resp.status();
+        let body = resp.text().await.map_err(|e| format!("Direct fetch body error: {}", e))?;
+        // Heuristic for blocked/invalid content
+        if !status.is_success() {
+            return Err(format!("Direct fetch HTTP error: {}", status));
+        }
+        let lower = body.to_lowercase();
+        if lower.contains("access denied") || lower.contains("captcha") || lower.contains("blocked") || lower.contains("cloudflare") || lower.trim().is_empty() {
+            return Err("Blocked or invalid content detected".to_string());
+        }
+        Ok(body)
+    }
+
+    async fn fetch_playwright(&self, context_pool: ContextPool, url: &str, take_screenshot: bool) -> Result<(String, Vec<u8>), String> {
+        let context = context_pool.acquire().await;
+        let page = context.new_page().await.map_err(|e| format!("Playwright new_page error: {}", e))?;
+        page.goto_builder(url)
+            .wait_until(DocumentLoadState::DomContentLoaded)
+            .goto().await.map_err(|e| format!("Playwright goto error: {}", e))?;
+        let html = page.content().await.map_err(|e| format!("Playwright content error: {}", e))?;
+        let screenshot = if take_screenshot {
+            page.screenshot_builder().full_page(true).screenshot().await.unwrap_or_default()
+        } else {
+            vec![]
+        };
+        context_pool.release(context).await;
+        Ok((html, screenshot))
+    }
 }
 
 #[tonic::async_trait]
@@ -70,6 +151,8 @@ impl WebContentService for ExtractorService {
         &self,
         request: Request<ExtractContentRequest>,
     ) -> Result<Response<ExtractContentResponse>, Status> {
+        self.maybe_reset_browser().await;
+        let context_pool = self.get_context_pool().await;
         let req = request.into_inner();
         let url = req.url.clone();
         let output_md = req.output_md;
@@ -83,14 +166,57 @@ impl WebContentService for ExtractorService {
         let mut openai_response = String::new();
         let mut error = String::new();
         let start = std::time::Instant::now();
-        // Extraction logic
-        let result = async {
-            let context = self.context_pool.acquire().await;
-            let page = context.new_page().await?;
-            page.goto_builder(&url)
-                .wait_until(DocumentLoadState::DomContentLoaded)
-                .goto().await?;
-            html = page.content().await?;
+
+        // Parallel extraction logic
+        let direct_fut = self.fetch_direct(&url);
+        let playwright_fut = self.fetch_playwright(context_pool.clone(), &url, take_screenshot);
+        tokio::pin!(direct_fut);
+        tokio::pin!(playwright_fut);
+        let mut used_playwright = false;
+        let html_ok;
+        tokio::select! {
+            direct = &mut direct_fut => {
+                match direct {
+                    Ok(body) => {
+                        html = body;
+                        screenshot = vec![];
+                        html_ok = true;
+                    },
+                    Err(_) => {
+                        // Wait for playwright
+                        match playwright_fut.await {
+                            Ok((body, shot)) => {
+                                html = body;
+                                screenshot = shot;
+                                used_playwright = true;
+                                html_ok = true;
+                            },
+                            Err(e) => {
+                                error = e;
+                                screenshot = vec![];
+                                html_ok = false;
+                            }
+                        }
+                    }
+                }
+            },
+            playwright = &mut playwright_fut => {
+                match playwright {
+                    Ok((body, shot)) => {
+                        html = body;
+                        screenshot = shot;
+                        used_playwright = true;
+                        html_ok = true;
+                    },
+                    Err(e) => {
+                        error = e;
+                        screenshot = vec![];
+                        html_ok = false;
+                    }
+                }
+            }
+        }
+        if html_ok {
             // Remove <script>, <style>, <iframe>, <noscript> tags and their content using regex (no backreferences)
             let cleaned_html = {
                 let mut cleaned = html.clone();
@@ -100,9 +226,6 @@ impl WebContentService for ExtractorService {
                 }
                 cleaned
             };
-            if take_screenshot {
-                screenshot = page.screenshot_builder().full_page(true).screenshot().await?;
-            }
             if use_openai {
                 let openai_api_key = std::env::var("OPENAI_API_KEY").map_err(|_| Status::internal("OPENAI_API_KEY must be set"))?;
                 let client = reqwest::Client::new();
@@ -142,15 +265,10 @@ impl WebContentService for ExtractorService {
                     }
                 }
             }
-            self.context_pool.release(context).await;
-            Ok::<(), anyhow::Error>(())
-        }.await;
-        if let Err(e) = result {
-            error = format!("{}", e);
         }
         let elapsed = start.elapsed();
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-        println!("[{}] [web-content-service] URL: {} | Elapsed time: {:.2?}", now, url, elapsed);
+        println!("[{}] [web-content-service] URL: {} | Elapsed time: {:.2?} | Used: {}", now, url, elapsed, if used_playwright {"playwright"} else {"direct"});
         Ok(Response::new(ExtractContentResponse {
             html,
             markdown,
@@ -174,8 +292,16 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     let pool_size = 4;
     let context_pool = ContextPool::new(pool_size, &browser).await;
+    let shared_state = Arc::new(Mutex::new(SharedState {
+        browser: Some(browser),
+        context_pool: Some(context_pool),
+        request_count: 0,
+    }));
     let service = ExtractorService {
-        context_pool: Arc::new(context_pool),
+        shared_state: shared_state.clone(),
+        browser_executable,
+        pool_size,
+        playwright,
     };
     let addr = format!("[::0]:{}", cli.port).parse()?;
     println!("Starting gRPC server on {}", addr);

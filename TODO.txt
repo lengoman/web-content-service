@@ -1,0 +1,1 @@
+1. Add IP to DynamoDB for dynamic server registration
