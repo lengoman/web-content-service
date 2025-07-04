@@ -143,6 +143,48 @@ impl ExtractorService {
         context_pool.release(context).await;
         Ok((html, screenshot))
     }
+
+    async fn reset_browser(&self) {
+        let mut state = self.shared_state.lock().await;
+        // Drop old browser and context pool
+        state.browser = None;
+        state.context_pool = None;
+        // Create new browser and context pool
+        let browser = self.playwright.chromium()
+            .launcher()
+            .executable(std::path::Path::new(&self.browser_executable))
+            .headless(true)
+            .launch()
+            .await
+            .expect("Failed to relaunch browser");
+        let context_pool = ContextPool::new(self.pool_size, &browser).await;
+        state.browser = Some(browser);
+        state.context_pool = Some(context_pool);
+        state.request_count = 0;
+        println!("[web-content-service] Browser and context pool reset due to timeout");
+    }
+
+    async fn fetch_playwright_with_retries(&self, url: &str, take_screenshot: bool) -> Result<(String, Vec<u8>), String> {
+        let mut last_err = None;
+        for attempt in 0..3 {
+            let context_pool = self.get_context_pool().await;
+            let result = self.fetch_playwright(context_pool, url, take_screenshot).await;
+            match &result {
+                Ok(_) => return result,
+                Err(e) => {
+                    if e.to_lowercase().contains("timeout") {
+                        println!("[web-content-service] Playwright timeout on attempt {} for {}. Resetting browser and retrying...", attempt + 1, url);
+                        self.reset_browser().await;
+                        last_err = Some(e.clone());
+                        continue;
+                    } else {
+                        return Err(e.clone());
+                    }
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| "Playwright failed after 3 attempts".to_string()))
+    }
 }
 
 #[tonic::async_trait]
@@ -169,7 +211,7 @@ impl WebContentService for ExtractorService {
 
         // Parallel extraction logic
         let direct_fut = self.fetch_direct(&url);
-        let playwright_fut = self.fetch_playwright(context_pool.clone(), &url, take_screenshot);
+        let playwright_fut = self.fetch_playwright_with_retries(&url, take_screenshot);
         tokio::pin!(direct_fut);
         tokio::pin!(playwright_fut);
         let mut used_playwright = false;
