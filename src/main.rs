@@ -180,7 +180,28 @@ impl ExtractorService {
         page.goto_builder(url)
             .wait_until(DocumentLoadState::DomContentLoaded)
             .goto().await.map_err(|e| format!("Playwright goto error: {}", e))?;
-        let html = page.content().await.map_err(|e| format!("Playwright content error: {}", e))?;
+        // Retry page.content() up to 3 times if 'Execution context was destroyed' error occurs
+        let mut html = None;
+        for _ in 0..3 {
+            match page.content().await {
+                Ok(h) => {
+                    html = Some(h);
+                    break;
+                }
+                Err(e) => {
+                    let msg = format!("{}", e);
+                    if msg.contains("Execution context was destroyed") {
+                        // Wait a bit and retry
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        continue;
+                    } else {
+                        context_pool.release(context).await;
+                        return Err(format!("Content error: {}", msg));
+                    }
+                }
+            }
+        }
+        let html = html.ok_or_else(|| "Content error: Execution context was destroyed after retries".to_string())?;
         let screenshot = if take_screenshot {
             page.screenshot_builder().full_page(true).screenshot().await.unwrap_or_default()
         } else {
@@ -217,8 +238,9 @@ impl ExtractorService {
             match &result {
                 Ok(_) => return result,
                 Err(e) => {
-                    if e.to_lowercase().contains("timeout") {
-                        println!("[web-content-service] Playwright timeout on attempt {} for {}. Resetting browser and retrying...", attempt + 1, url);
+                    let err_lc = e.to_lowercase();
+                    if err_lc.contains("timeout") || err_lc.contains("execution context was destroyed") {
+                        println!("[web-content-service] Error (timeout or context destroyed) on attempt {} for {}. Resetting browser and retrying...", attempt + 1, url);
                         self.reset_browser().await;
                         last_err = Some(e.clone());
                         continue;
@@ -228,7 +250,7 @@ impl ExtractorService {
                 }
             }
         }
-        Err(last_err.unwrap_or_else(|| "Playwright failed after 3 attempts".to_string()))
+        Err(last_err.unwrap_or_else(|| "Failed after 3 attempts".to_string()))
     }
 }
 
