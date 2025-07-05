@@ -75,11 +75,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Error: {}", response.error);
         std::process::exit(1);
     }
-    if cli.take_screenshot && !response.screenshot.is_empty() {
-        let mut file = File::create("image.png")?;
-        file.write_all(&response.screenshot)?;
-        println!("Screenshot saved to image.png");
-        return Ok(());
+    if cli.take_screenshot {
+        if !response.screenshot.is_empty() {
+            let mut file = File::create("image.png")?;
+            file.write_all(&response.screenshot)?;
+            println!("Screenshot saved to image.png");
+            return Ok(());
+        } else {
+            eprintln!("Error: Screenshot was requested but not returned by the server.");
+            if !response.error.is_empty() {
+                eprintln!("Server error: {}", response.error);
+            }
+            std::process::exit(1);
+        }
     }
     if cli.use_openai && !response.openai_response.is_empty() {
         println!("{}", response.openai_response);

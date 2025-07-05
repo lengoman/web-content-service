@@ -209,7 +209,25 @@ impl ExtractorService {
         }
         let html = html.ok_or_else(|| "Content error: Execution context was destroyed after retries".to_string())?;
         let screenshot = if take_screenshot {
-            page.screenshot_builder().full_page(true).screenshot().await.unwrap_or_default()
+            match page.screenshot_builder().full_page(true).screenshot().await {
+                Ok(shot) => {
+                    log_to_file_and_stdout(&format!(
+                        "[{}] [web-content-service] Screenshot SUCCESS ({} bytes)\n",
+                        chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                        shot.len()
+                    ));
+                    shot
+                },
+                Err(e) => {
+                    log_to_file_and_stdout(&format!(
+                        "[{}] [web-content-service] Screenshot FAILED: {}\n",
+                        chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                        e
+                    ));
+                    context_pool.release(context).await;
+                    return Err(format!("Screenshot error: {}", e));
+                }
+            }
         } else {
             vec![]
         };
@@ -318,8 +336,8 @@ impl WebContentService for ExtractorService {
         let mut error = String::new();
         let start = std::time::Instant::now();
 
-        // Check cache before fetching if enabled (server-side)
-        if self.use_cache {
+        // Only use cache for non-screenshot requests
+        if self.use_cache && !take_screenshot {
             if let Some((cached_html, _file_path)) = cache::get_cached_html(&url) {
                 html = cached_html;
                 let elapsed = start.elapsed();
@@ -335,57 +353,74 @@ impl WebContentService for ExtractorService {
             }
         }
 
-        // Parallel extraction logic
-        let direct_fut = self.fetch_direct(&url);
-        let playwright_fut = self.fetch_playwright_with_retries(&url, take_screenshot);
-        tokio::pin!(direct_fut);
-        tokio::pin!(playwright_fut);
         let mut used_playwright = false;
         let html_ok;
-        tokio::select! {
-            direct = &mut direct_fut => {
-                match direct {
-                    Ok(body) => {
-                        html = body;
-                        screenshot = vec![];
-                        html_ok = true;
-                    },
-                    Err(_) => {
-                        // Wait for playwright
-                        match playwright_fut.await {
-                            Ok((body, shot)) => {
-                                html = body;
-                                screenshot = shot;
-                                used_playwright = true;
-                                html_ok = true;
-                            },
-                            Err(e) => {
-                                error = e;
-                                screenshot = vec![];
-                                html_ok = false;
+        if take_screenshot {
+            // Always use Playwright if screenshot is requested
+            match self.fetch_playwright_with_retries(&url, take_screenshot).await {
+                Ok((body, shot)) => {
+                    html = body;
+                    screenshot = shot;
+                    used_playwright = true;
+                    html_ok = true;
+                }
+                Err(e) => {
+                    error = e;
+                    screenshot = vec![];
+                    html_ok = false;
+                }
+            }
+        } else {
+            // Parallel extraction logic
+            let direct_fut = self.fetch_direct(&url);
+            let playwright_fut = self.fetch_playwright_with_retries(&url, take_screenshot);
+            tokio::pin!(direct_fut);
+            tokio::pin!(playwright_fut);
+            tokio::select! {
+                direct = &mut direct_fut => {
+                    match direct {
+                        Ok(body) => {
+                            html = body;
+                            screenshot = vec![];
+                            html_ok = true;
+                        },
+                        Err(_) => {
+                            // Wait for playwright
+                            match playwright_fut.await {
+                                Ok((body, shot)) => {
+                                    html = body;
+                                    screenshot = shot;
+                                    used_playwright = true;
+                                    html_ok = true;
+                                },
+                                Err(e) => {
+                                    error = e;
+                                    screenshot = vec![];
+                                    html_ok = false;
+                                }
                             }
                         }
                     }
-                }
-            },
-            playwright = &mut playwright_fut => {
-                match playwright {
-                    Ok((body, shot)) => {
-                        html = body;
-                        screenshot = shot;
-                        used_playwright = true;
-                        html_ok = true;
-                    },
-                    Err(e) => {
-                        error = e;
-                        screenshot = vec![];
-                        html_ok = false;
+                },
+                playwright = &mut playwright_fut => {
+                    match playwright {
+                        Ok((body, shot)) => {
+                            html = body;
+                            screenshot = shot;
+                            used_playwright = true;
+                            html_ok = true;
+                        },
+                        Err(e) => {
+                            error = e;
+                            screenshot = vec![];
+                            html_ok = false;
+                        }
                     }
                 }
             }
         }
-        // Store in cache after successful fetch if enabled (server-side)
-        if html_ok && self.use_cache {
+        // Store in cache after successful fetch if enabled (server-side) and not a screenshot request
+        if html_ok && self.use_cache && !take_screenshot {
             let _ = cache::set_cached_html(&url, &html);
         }
         if html_ok {
@@ -437,6 +472,9 @@ impl WebContentService for ExtractorService {
                     }
                 }
             }
+        }
+        if take_screenshot && screenshot.is_empty() && error.is_empty() {
+            error = "Failed to capture screenshot".to_string();
         }
         let elapsed = start.elapsed();
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
