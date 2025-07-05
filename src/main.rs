@@ -4,7 +4,13 @@ use playwright::api::Browser;
 use playwright::api::BrowserContext;
 use playwright::api::DocumentLoadState;
 use playwright::Playwright;
+use std::fs::File;
+use std::fs::OpenOptions;
+use std::io::Write as IoWrite;
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::pin::Pin;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tonic::{transport::Server, Request, Response, Status};
 
@@ -256,6 +262,43 @@ impl ExtractorService {
 
 #[tonic::async_trait]
 impl WebContentService for ExtractorService {
+    type StreamLogsStream = Pin<Box<dyn tokio_stream::Stream<Item = Result<webcontent::LogLine, tonic::Status>> + Send + 'static>>;
+
+    async fn stream_logs(
+        &self,
+        _request: Request<webcontent::LogRequest>,
+    ) -> Result<Response<Self::StreamLogsStream>, Status> {
+        // Path to the log file
+        let log_path = "web-content-service.log";
+        // Open the log file and seek to the end
+        let file = File::open(log_path).map_err(|e| Status::internal(format!("Failed to open log file: {}", e)))?;
+        let mut reader = BufReader::new(file);
+        let _ = reader.seek(SeekFrom::End(0));
+        // Use a channel to send new lines
+        let (tx, rx) = mpsc::channel(100);
+        // Spawn a task to tail the log file
+        tokio::spawn(async move {
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => {
+                        // No new line, wait a bit
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        continue;
+                    }
+                    Ok(_) => {
+                        let _ = tx.send(Ok(webcontent::LogLine { line: line.clone() })).await;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(Status::internal(format!("Log read error: {}", e)))).await;
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)) as Self::StreamLogsStream))
+    }
+
     async fn extract_content(
         &self,
         request: Request<ExtractContentRequest>,
@@ -281,7 +324,7 @@ impl WebContentService for ExtractorService {
                 html = cached_html;
                 let elapsed = start.elapsed();
                 let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                println!("[{}] [web-content-service] URL: {} | Elapsed time: {:.2?} | Used: cache", now, url, elapsed);
+                log_to_file_and_stdout(&format!("[{}] [web-content-service] URL: {} | Elapsed time: {:.2?} | Used: cache\n", now, url, elapsed));
                 return Ok(Response::new(ExtractContentResponse {
                     html,
                     markdown,
@@ -397,7 +440,7 @@ impl WebContentService for ExtractorService {
         }
         let elapsed = start.elapsed();
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-        println!("[{}] [web-content-service] URL: {} | Elapsed time: {:.2?} | Used: {}", now, url, elapsed, if used_playwright {"playwright"} else {"direct"});
+        log_to_file_and_stdout(&format!("[{}] [web-content-service] URL: {} | Elapsed time: {:.2?} | Used: {}\n", now, url, elapsed, if used_playwright {"playwright"} else {"direct"}));
         Ok(Response::new(ExtractContentResponse {
             html,
             markdown,
@@ -406,6 +449,16 @@ impl WebContentService for ExtractorService {
             error,
         }))
     }
+}
+
+fn log_to_file_and_stdout(msg: &str) {
+    print!("{}", msg);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("web-content-service.log")
+        .unwrap();
+    let _ = file.write_all(msg.as_bytes());
 }
 
 #[tokio::main]
@@ -433,7 +486,7 @@ async fn main() -> anyhow::Result<()> {
         use_cache: cli.use_cache,
     };
     let addr = format!("[::0]:{}", cli.port).parse()?;
-    println!("Starting gRPC server on {}", addr);
+    log_to_file_and_stdout(&format!("Starting gRPC server on {}\n", addr));
     Server::builder()
         .add_service(WebContentServiceServer::new(service))
         .serve(addr)

@@ -4,6 +4,7 @@ package webcontent;
 
 service WebContentService {
   rpc ExtractContent (ExtractContentRequest) returns (ExtractContentResponse);
+  rpc StreamLogs (LogRequest) returns (stream LogLine);
 }
 
 message ExtractContentRequest {
@@ -22,4 +23,9 @@ message ExtractContentResponse {
   bytes screenshot = 3;
   string openai_response = 4;
   string error = 5;
+}
+
+message LogRequest {}
+message LogLine {
+  string line = 1;
 } 

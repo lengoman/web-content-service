@@ -11,9 +11,9 @@ use webcontent::ExtractContentRequest;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
-    /// The URL to extract content from
+    /// The URL to extract content from (optional if --show-logs)
     #[arg(long)]
-    url: String,
+    url: Option<String>,
     /// Output markdown
     #[arg(long, default_value_t = false)]
     output_md: bool,
@@ -35,6 +35,9 @@ struct Cli {
     /// gRPC server port
     #[arg(long, default_value_t = 50051)]
     port: u16,
+    /// Show logs from the server
+    #[arg(long, default_value_t = false)]
+    show_logs: bool,
 }
 
 #[tokio::main]
@@ -42,8 +45,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let addr = format!("http://{}:{}", cli.host, cli.port);
     let mut client = WebContentServiceClient::connect(addr).await?;
+    if cli.show_logs {
+        let mut stream = client.stream_logs(tonic::Request::new(webcontent::LogRequest {})).await?.into_inner();
+        println!("--- Streaming logs from server ---");
+        while let Some(line) = stream.message().await? {
+            print!("{}", line.line);
+        }
+        return Ok(());
+    }
+    // Require --url if not showing logs
+    let url = match cli.url {
+        Some(u) => u,
+        None => {
+            eprintln!("Error: --url is required unless --show-logs is set");
+            std::process::exit(1);
+        }
+    };
     let request = tonic::Request::new(ExtractContentRequest {
-        url: cli.url,
+        url,
         output_md: cli.output_md,
         use_openai: cli.use_openai,
         model: cli.model,
